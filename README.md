@@ -72,10 +72,12 @@ Optional settings:
 ### Run
 
 ```bash
-python bot.py
+nohup python bot.py &
 ```
 
-Then go take a bath and code from there. That's the whole point.
+Use `nohup` so the bot keeps running after you close the terminal (or wander off to the bathtub). Without it, your SSH session dying = your bot dying. Logs go to `nohup.out`.
+
+If you prefer, you can also use `screen`, `tmux`, or run it as a systemd service — whatever keeps it alive while you're away.
 
 ## Usage
 
