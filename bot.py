@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import uuid
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 
@@ -44,6 +45,7 @@ CLAUDE_MAX_BUDGET_USD = float(os.getenv("CLAUDE_MAX_BUDGET_USD", "1.00"))
 CLAUDE_TIMEOUT_SECONDS = int(os.getenv("CLAUDE_TIMEOUT_SECONDS", "300"))
 
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
+LOGS_DIR = Path(__file__).parent / "logs"
 MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 
 
@@ -140,9 +142,13 @@ class ClaudeRunner:
         if model:
             cmd += ["--model", model]
 
-        # Tool restrictions
+        # Tool restrictions & permission mode
         if CLAUDE_ALLOWED_TOOLS:
-            cmd += ["--allowedTools", CLAUDE_ALLOWED_TOOLS]
+            tools = [t.strip() for t in CLAUDE_ALLOWED_TOOLS.split(",") if t.strip()]
+            cmd += ["--allowedTools"] + tools
+
+        # Non-interactive: auto-deny tools not in allowedTools instead of prompting
+        cmd += ["--permission-mode", "dontAsk"]
 
         # Budget cap
         cmd += ["--max-turns", "50"]
@@ -153,11 +159,14 @@ class ClaudeRunner:
         logger.info("Running: %s", " ".join(cmd))
 
         cwd = CLAUDE_WORKING_DIR or None
+        env = {**os.environ}
+        env.pop("CLAUDECODE", None)
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
+            env=env,
         )
 
         try:
@@ -266,6 +275,34 @@ def format_cost(response: dict) -> str:
     return ""
 
 
+def log_conversation(user: object, session: dict, prompt: str, response: dict, reply_text: str):
+    """Append a conversation entry to the daily log file (JSONL).
+
+    The full conversation is also stored by the Claude CLI in
+    ~/.claude/projects/<project>/  as <session_id>.jsonl.
+    This log provides a quick index: who asked what, when, cost,
+    and which session_id to look up for the full history.
+    """
+    LOGS_DIR.mkdir(exist_ok=True)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    log_file = LOGS_DIR / f"{today}.jsonl"
+
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "user_id": user.id,
+        "username": user.username,
+        "session_id": session.get("session_id", ""),
+        "model": session.get("model") or CLAUDE_MODEL or "default",
+        "prompt": prompt,
+        "response_preview": reply_text[:200],
+        "cost_usd": response.get("cost_usd"),
+        "error": response.get("error"),
+    }
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -281,6 +318,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reset - Start a new conversation\n"
         "/model <name> - Switch model (sonnet/opus/haiku)\n"
         "/status - Show session info\n"
+        "/logs [n] - Show last n conversations (default 5)\n"
         "/help - Show this message"
     )
 
@@ -327,6 +365,47 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized
+async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show recent conversation log entries for this user."""
+    user_id = update.effective_user.id
+    count = 5
+    if context.args:
+        try:
+            count = min(int(context.args[0]), 20)
+        except ValueError:
+            pass
+
+    entries = []
+    if LOGS_DIR.exists():
+        # Read log files in reverse chronological order
+        for log_file in sorted(LOGS_DIR.glob("*.jsonl"), reverse=True):
+            for line in reversed(log_file.read_text().splitlines()):
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("user_id") == user_id:
+                    entries.append(entry)
+                    if len(entries) >= count:
+                        break
+            if len(entries) >= count:
+                break
+
+    if not entries:
+        await update.message.reply_text("No conversation logs found.")
+        return
+
+    lines = []
+    for e in entries:
+        ts = e["timestamp"][:19].replace("T", " ")
+        cost = f" [${e['cost_usd']:.4f}]" if e.get("cost_usd") else ""
+        preview = e.get("response_preview", "")[:80]
+        lines.append(f"{ts} | {e['session_id'][:8]}...\n> {e['prompt'][:80]}\n{preview}{cost}\n")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@authorized
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward user message to Claude CLI and send back the response."""
     user_id = update.effective_user.id
@@ -355,6 +434,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not reply:
         reply = "(empty response from Claude)"
+
+    # Log the conversation
+    log_conversation(update.effective_user, session, text, response, reply)
 
     full_reply = reply + cost_info
 
@@ -397,6 +479,7 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("logs", cmd_logs))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)

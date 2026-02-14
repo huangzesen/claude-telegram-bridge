@@ -5,4 +5,5 @@ venv/
 .env
 sessions.json
 *.log
+logs/
 .DS_Store
